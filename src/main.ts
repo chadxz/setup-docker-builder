@@ -428,6 +428,35 @@ async function startBlacksmithBuilder(
   inputs: Inputs,
 ): Promise<{ addr: string | null; exposeId: string }> {
   try {
+    // Check if buildkitd is already running BEFORE mounting the sticky disk.
+    // If buildkitd is already running, this is a second invocation of
+    // setup-docker-builder in the same job (e.g. via a composite action called
+    // twice). Mounting a new sticky disk on top of /var/lib/buildkit while
+    // buildkitd is running would corrupt its overlayfs snapshot state, causing
+    // subsequent builds to fail with errors like:
+    //   "lstat /var/lib/buildkit/runc-overlayfs/snapshots/snapshots/N: no such file or directory"
+    // Instead, skip setup entirely and let the fallback path reuse the existing
+    // configured builder from the first invocation.
+    try {
+      const { stdout } = await execAsync("pgrep buildkitd");
+      if (stdout.trim()) {
+        core.info(
+          `Detected existing buildkitd process (PID: ${stdout.trim()}). ` +
+            `setup-docker-builder appears to be invoked more than once in this job. ` +
+            `Skipping builder setup to avoid corrupting the existing builder's overlayfs snapshot state.`,
+        );
+        return { addr: null, exposeId: "" };
+      }
+    } catch (error) {
+      if ((error as { code?: number }).code !== 1) {
+        // pgrep returns exit code 1 when no process found, which is what we want
+        throw new Error(
+          `Failed to check for existing buildkitd process: ${(error as Error).message}`,
+        );
+      }
+      // Exit code 1 means no buildkitd process found, we can proceed
+    }
+
     // Setup sticky disk
     const stickyDiskStartTime = Date.now();
     const stickyDiskSetup = await setupStickyDisk();
@@ -462,25 +491,6 @@ async function startBlacksmithBuilder(
         `Overriding max-parallelism from ${parallelism} (nproc) to ${inputs["max-parallelism"]} (user-specified)`,
       );
       parallelism = inputs["max-parallelism"];
-    }
-
-    // Check if buildkitd is already running before starting
-    try {
-      const { stdout } = await execAsync("pgrep buildkitd");
-      if (stdout.trim()) {
-        throw new Error(
-          `Detected existing buildkitd process (PID: ${stdout.trim()}). Refusing to start to avoid conflicts.`,
-        );
-      }
-    } catch (error) {
-      if ((error as { code?: number }).code !== 1) {
-        // pgrep returns exit code 1 when no process found, which is what we want
-        // Any other error code indicates a real problem
-        throw new Error(
-          `Failed to check for existing buildkitd process: ${(error as Error).message}`,
-        );
-      }
-      // Exit code 1 means no buildkitd process found, which is good - we can proceed
     }
 
     // Check for potential boltdb corruption
@@ -639,8 +649,12 @@ void actionsToolkit.run(
         core.info("Blacksmith builder is ready for use by Docker");
       });
     } else {
-      // Fallback to local builder
-      core.warning("Failed to setup Blacksmith builder, using local builder");
+      // Fallback: either Blacksmith builder setup failed, or buildkitd was
+      // already running (second invocation in the same job). In both cases,
+      // reuse whatever builder is already configured.
+      core.warning(
+        "Blacksmith builder setup skipped or failed, checking for existing configured builder",
+      );
       await core.group(`Checking for configured builder`, async () => {
         try {
           const builder = await toolkit.builder.inspect();
